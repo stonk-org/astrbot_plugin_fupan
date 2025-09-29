@@ -15,7 +15,7 @@ from astrbot.core.star.star_tools import StarTools
     "astrbot_plugin_fupan",
     "zanderzhng",
     "复盘打卡插件，用于帮助交易者进行每日复盘打卡。支持交易日判断、时间窗口控制、数据统计等功能。",
-    "1.0.0",
+    "0.0.1",
 )
 class FuPanPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):

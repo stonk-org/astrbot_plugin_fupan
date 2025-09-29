@@ -3,4 +3,4 @@ desc: 复盘插件，用于帮助交易者进行每日复盘。支持交易日�
 help: 输入 /复盘帮助 查看复盘插件帮助。 # 插件的帮助信息
 version: v0.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: zanderzhng # 作者
-repo: https://github.com/zanderzhng/nonebot-plugin-fupan # 插件的仓库地址
+repo: https://github.com/stonk-org/nonebot-plugin-fupan # 插件的仓库地址
