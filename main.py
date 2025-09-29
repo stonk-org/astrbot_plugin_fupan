@@ -7,6 +7,7 @@ import exchange_calendars as xcals
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.star.star_tools import StarTools
 
 
 @register(
@@ -23,14 +24,9 @@ class FuPanPlugin(Star):
         # 初始化交易所日历 (使用中国A股日历)
         self.xcal = xcals.get_calendar("XSHG")  # 上海证券交易所日历
 
-        # 获取插件数据目录 (遵循 AstrBot 规范，存储在 bot 的 data 目录下)
-        self.data_dir = os.path.join("data", "astrbot_plugin_fupan")
-        try:
-            os.makedirs(self.data_dir, exist_ok=True)
-        except (OSError, IOError) as e:
-            logger.error(f"创建数据目录时出错: {e}")
-
-        logger.info("复盘打卡插件已加载")
+        # 获取插件数据目录 (使用 AstrBot 官方提供的持久化数据目录)
+        self.data_dir = str(StarTools.get_data_dir("astrbot_plugin_fupan"))
+        logger.info(f"复盘打卡插件已加载，数据目录: {self.data_dir}")
 
     def get_checkin_data_file(self, user_id: str, group_id: Optional[str] = None) -> str:
         """获取用户打卡数据文件路径"""
