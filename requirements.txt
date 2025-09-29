@@ -1,1 +1,2 @@
-exchange-calendars>=4.11.1
+exchange-calendars
+apscheduler

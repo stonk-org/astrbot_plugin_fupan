@@ -24,5 +24,18 @@
     "default": {},
     "hint": "为特定用户设置自定义时间窗口",
     "items": {}
+  },
+  "use_llm_consolidation": {
+    "description": "是否使用LLM进行复盘消息整合",
+    "type": "bool",
+    "default": true,
+    "hint": "启用后将使用LLM对复盘消息进行智能整合和总结"
+  },
+  "llm_provider_id": {
+    "description": "LLM提供商ID",
+    "type": "string",
+    "default": "",
+    "hint": "指定使用的LLM提供商ID，留空则使用当前会话的默认提供商",
+    "obvious_hint": true
   }
 }

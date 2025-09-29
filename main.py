@@ -4,8 +4,9 @@ from datetime import datetime, time
 from typing import Optional
 
 import exchange_calendars as xcals
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, filter, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.core.star.star_tools import StarTools
 
@@ -19,6 +20,7 @@ from astrbot.core.star.star_tools import StarTools
 class FuPanPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
+        self.context = context
         self.config = config
 
         # 初始化交易所日历 (使用中国A股日历)
@@ -28,12 +30,52 @@ class FuPanPlugin(Star):
         self.data_dir = str(StarTools.get_data_dir("astrbot_plugin_fupan"))
         logger.info(f"复盘打卡插件已加载，数据目录: {self.data_dir}")
 
+        # 初始化APScheduler用于定时广播
+        self.scheduler = AsyncIOScheduler()
+
+        # 存储群组会话信息用于广播
+        self.group_sessions = self.load_group_sessions()
+
+        # 启动调度器
+        self.scheduler.start()
+
+        # 添加每日9:00的广播任务
+        self.scheduler.add_job(
+            self.send_daily_review,
+            "cron",
+            hour=9,
+            minute=0,
+            misfire_grace_time=60,
+            id="fupan_daily_review"
+        )
+
     def get_checkin_data_file(self, user_id: str, group_id: Optional[str] = None) -> str:
         """获取用户打卡数据文件路径"""
         if group_id:
             return os.path.join(self.data_dir, f"checkin_{user_id}_group_{group_id}.json")
         else:
             return os.path.join(self.data_dir, f"checkin_{user_id}_dm.json")
+
+    def save_group_sessions(self):
+        """保存群组会话信息到持久化存储"""
+        try:
+            session_file = os.path.join(self.data_dir, "group_sessions.json")
+            with open(session_file, "w", encoding="utf-8") as f:
+                json.dump(self.group_sessions, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存群组会话信息时出错: {e}")
+
+    def load_group_sessions(self):
+        """从持久化存储加载群组会话信息"""
+        try:
+            session_file = os.path.join(self.data_dir, "group_sessions.json")
+            if os.path.exists(session_file):
+                with open(session_file, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logger.error(f"加载群组会话信息时出错: {e}")
+            return {}
 
     def get_all_checkin_files(self) -> list:
         """获取所有用户的打卡数据文件"""
@@ -432,6 +474,27 @@ class FuPanPlugin(Star):
         next_trading_day = self.get_next_trading_day(now)
         next_trading_day_str = next_trading_day.strftime("%Y年%m月%d日") if next_trading_day else "未知"
 
+        # 保存数据
+        self.save_user_checkin_data(user_id, user_data, group_id)
+
+        # 如果是群组消息，保存会话信息用于广播
+        if group_id:
+            self.group_sessions[group_id] = event.unified_msg_origin
+            self.save_group_sessions()
+
+        # 获取当前和下一个交易日信息
+        current_trading_day = now.date()
+        # 如果今天是交易日，则显示今天的日期作为当前交易日
+        if self.is_trading_day(now):
+            current_trading_day_str = current_trading_day.strftime("%Y年%m月%d日")
+        else:
+            # 如果今天不是交易日，获取最近的交易日
+            previous_trading_day = self.get_previous_trading_day(now)
+            current_trading_day_str = previous_trading_day.strftime("%Y年%m月%d日") if previous_trading_day else "未知"
+
+        next_trading_day = self.get_next_trading_day(now)
+        next_trading_day_str = next_trading_day.strftime("%Y年%m月%d日") if next_trading_day else "未知"
+
         # 发送成功消息，包含当前和下一个交易日信息
         strike_count = user_data.get("strike_count", 0)
         success_msg = (
@@ -490,6 +553,48 @@ class FuPanPlugin(Star):
             stats_msg += "📚 暂无复盘记录\n"
 
         yield event.plain_result(stats_msg)
+
+    # 强制触发LLM总结命令
+    @filter.command("复盘总结", alias={"复盘 summary"})
+    @filter.permission_type(filter.PermissionType.ADMIN)  # 仅限管理员或OP使用
+    async def fupan_summary(self, event: AstrMessageEvent):
+        """强制触发当前群组的LLM复盘总结（仅限管理员或OP）"""
+        # 检查是否在群组中使用
+        group_id = event.get_group_id()
+        if not group_id:
+            yield event.plain_result("❌ 该命令只能在群组中使用")
+            return
+
+        try:
+            # 检查是否启用LLM整合
+            use_llm = self.config.get("use_llm_consolidation", True)
+            if not use_llm:
+                yield event.plain_result("❌ LLM整合功能未启用，请在配置中启用")
+                return
+
+            # 获取当前时间
+            now = datetime.now()
+
+            # 获取上一个交易日作为复盘日期
+            previous_trading_day = self.get_previous_trading_day(now)
+            if not previous_trading_day:
+                yield event.plain_result("❌ 无法获取上一个交易日信息")
+                return
+
+            review_date = previous_trading_day.strftime("%Y-%m-%d")
+            review_date_display = previous_trading_day.strftime("%Y年%m月%d日")
+
+            # 使用共享的总结生成方法
+            summary_content = await self.generate_group_summary(group_id, review_date, review_date_display)
+
+            # 生成总结消息
+            summary_msg = f"🤖 AI复盘总结 ({review_date_display})\n\n{summary_content}"
+
+            yield event.plain_result(summary_msg)
+
+        except Exception as e:
+            logger.error(f"生成复盘总结时出错: {e}")
+            yield event.plain_result(f"❌ 生成复盘总结时出错: {str(e)}")
 
     # 排行命令
     @filter.command("复盘排行", alias={"复盘 rank"})
@@ -643,6 +748,8 @@ class FuPanPlugin(Star):
             "  /复盘 [复盘结论] - 每日复盘（可附加结论）\n"
             "  /复盘统计 - 个人复盘统计\n"
             "  /复盘排行 - 复盘排行榜\n\n"
+            "🧠 AI功能命令：\n"
+            "  /复盘总结 - 强制生成当前群组AI复盘总结（仅管理员/OP）\n\n"
             "↩️ 其他命令：\n"
             "  /复盘撤销 | /撤销复盘 - 撤销最后复盘\n"
             f"  /复盘重置 - 重置数据（仅管理员）\n"
@@ -655,6 +762,254 @@ class FuPanPlugin(Star):
 
         yield event.plain_result(help_msg)
 
+    def get_previous_trading_days(self, date: datetime, count: int = 5) -> list:
+        """获取指定日期之前的count个交易日"""
+        trading_days = []
+        current_date = date.date()
+
+        # 向前查找交易日
+        while len(trading_days) < count and current_date > date.date().replace(year=date.year - 1):
+            if self.xcal.is_session(current_date):
+                trading_days.append(current_date)
+            current_date = self.xcal.previous_session(current_date).date() if self.xcal.previous_session(current_date) else current_date.replace(day=current_date.day - 1)
+
+        return sorted(trading_days)
+
+    def collect_group_checkins(self, group_id: str, trading_day: str) -> list:
+        """收集指定群组在指定交易日的复盘信息"""
+        group_checkins = []
+        all_files = self.get_all_checkin_files()
+
+        # 查找该群组的所有用户数据
+        for file_path in all_files:
+            if f"_group_{group_id}.json" in file_path:
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        user_data = json.load(f)
+
+                    # 查找该交易日的打卡记录
+                    for checkin in user_data.get("checkins", []):
+                        if checkin.get("trading_day") == trading_day and checkin.get("context") == "group":
+                            group_checkins.append({
+                                "user_id": user_data["user_id"],
+                                "nickname": user_data.get("nickname", user_data["user_id"]),
+                                "conclusion": checkin.get("conclusion", ""),
+                                "timestamp": checkin.get("timestamp"),
+                                "date": checkin.get("date")
+                            })
+                            break
+                except Exception as e:
+                    logger.error(f"读取用户数据文件 {file_path} 时出错: {e}")
+                    continue
+
+        return group_checkins
+
+    async def consolidate_with_llm(self, group_checkins: list, group_id: str) -> str:
+        """使用LLM对群组复盘信息进行整合和总结"""
+        try:
+            # 检查是否启用LLM整合
+            use_llm = self.config.get("use_llm_consolidation", True)
+            if not use_llm:
+                return ""
+
+            # 获取LLM提供商
+            provider_id = self.config.get("llm_provider_id", "")
+            if provider_id:
+                provider = self.context.get_provider_by_id(provider_id)
+            else:
+                # 使用当前会话的默认提供商
+                provider = self.context.get_using_provider()
+
+            if not provider:
+                logger.warning("未找到可用的LLM提供商，跳过智能整合")
+                return ""
+
+            # 构建输入内容
+            checkin_texts = []
+            for i, checkin in enumerate(group_checkins, 1):
+                nickname = checkin["nickname"] if checkin["nickname"] and checkin["nickname"] != checkin["user_id"] else f"用户{checkin['user_id'][:4]}***"
+                conclusion = checkin["conclusion"] if checkin["conclusion"] else "无具体结论"
+                checkin_texts.append(f"{i}. {nickname}: {conclusion}")
+
+            if not checkin_texts:
+                return ""
+
+            input_text = "以下是群组成员的交易复盘内容：\n" + "\n".join(checkin_texts) + "\n\n请对以上内容进行总结和分析，提供一个简洁的综合评述："
+
+            # 调用LLM进行文本处理
+            llm_resp = await provider.text_chat(
+                prompt=input_text,
+                system_prompt="你是一个专业的交易分析师，擅长总结和分析交易者的复盘内容。请提供简洁、有价值的综合评述。"
+            )
+
+            if llm_resp and hasattr(llm_resp, 'completion_text'):
+                return llm_resp.completion_text
+            else:
+                return ""
+
+        except Exception as e:
+            logger.error(f"使用LLM整合复盘信息时出错: {e}")
+            return ""
+
+    async def generate_daily_review_content(self) -> str:
+        """生成每日复盘播报内容"""
+        try:
+            now = datetime.now()
+
+            # 获取上一个交易日作为复盘日期
+            previous_trading_day = self.get_previous_trading_day(now)
+            if not previous_trading_day:
+                return "无法获取上一个交易日信息"
+
+            review_date = previous_trading_day.strftime("%Y-%m-%d")
+            review_date_display = previous_trading_day.strftime("%Y年%m月%d日")
+
+            # 统计各群组的复盘情况
+            review_content = f"📈 每日复盘播报 ({review_date_display})\n\n"
+
+            # 获取所有群组
+            group_ids = set()
+            all_files = self.get_all_checkin_files()
+
+            for file_path in all_files:
+                if "_group_" in file_path:
+                    # 从文件名中提取群组ID
+                    parts = file_path.split("_group_")
+                    if len(parts) > 1:
+                        group_id = parts[1].replace(".json", "")
+                        group_ids.add(group_id)
+
+            if not group_ids:
+                return "暂无群组复盘数据"
+
+            # 为每个群组生成复盘统计
+            for group_id in group_ids:
+                group_checkins = self.collect_group_checkins(group_id, review_date)
+
+                if group_checkins:
+                    review_content += f"📋 群组 {group_id} 复盘情况:\n"
+                    review_content += f"   参与人数: {len(group_checkins)}人\n\n"
+
+                    # 显示具体的复盘内容
+                    for i, checkin in enumerate(group_checkins, 1):
+                        nickname = checkin["nickname"] if checkin["nickname"] and checkin["nickname"] != checkin["user_id"] else f"用户{checkin['user_id'][:4]}***"
+                        conclusion = checkin["conclusion"] if checkin["conclusion"] else "无具体结论"
+                        review_content += f"   {i}. {nickname}: {conclusion}\n"
+
+                    # 使用LLM进行智能整合（如果启用）
+                    llm_summary = await self.consolidate_with_llm(group_checkins, group_id)
+                    if llm_summary:
+                        review_content += f"\n🤖 AI智能总结:\n   {llm_summary}\n"
+
+                    review_content += "\n"
+                else:
+                    review_content += f"📋 群组 {group_id}: 暂无复盘记录\n\n"
+
+            return review_content.strip()
+        except Exception as e:
+            logger.error(f"生成每日复盘播报内容时出错: {e}")
+            return f"生成复盘播报内容时出错: {str(e)}"
+
+    async def generate_group_summary(self, group_id: str, review_date: str, review_date_display: str) -> str:
+        """为指定群组生成复盘总结"""
+        try:
+            # 收集群组复盘信息
+            group_checkins = self.collect_group_checkins(group_id, review_date)
+
+            if not group_checkins:
+                return f"📋 群组 {group_id} 在 {review_date_display} 没有复盘记录"
+
+            # 生成基础统计信息
+            summary_msg = f"📋 群组 {group_id} 复盘情况:\n"
+            summary_msg += f"   参与人数: {len(group_checkins)}人\n\n"
+
+            # 显示具体的复盘内容
+            for i, checkin in enumerate(group_checkins, 1):
+                nickname = checkin["nickname"] if checkin["nickname"] and checkin["nickname"] != checkin["user_id"] else f"用户{checkin['user_id'][:4]}***"
+                conclusion = checkin["conclusion"] if checkin["conclusion"] else "无具体结论"
+                summary_msg += f"   {i}. {nickname}: {conclusion}\n"
+
+            # 使用LLM进行智能整合（如果启用）
+            llm_summary = await self.consolidate_with_llm(group_checkins, group_id)
+            if llm_summary:
+                summary_msg += f"\n🤖 AI智能总结:\n   {llm_summary}\n"
+
+            return summary_msg
+
+        except Exception as e:
+            logger.error(f"生成群组 {group_id} 复盘总结时出错: {e}")
+            return f"❌ 生成复盘总结时出错: {str(e)}"
+
+    async def send_daily_review(self):
+        """发送每日复盘播报"""
+        try:
+            # 检查今天是否为交易日
+            now = datetime.now()
+            if not self.is_trading_day(now):
+                logger.info("今天不是交易日，跳过复盘播报")
+                return
+
+            # 获取上一个交易日作为复盘日期
+            previous_trading_day = self.get_previous_trading_day(now)
+            if not previous_trading_day:
+                logger.error("无法获取上一个交易日信息")
+                return
+
+            review_date = previous_trading_day.strftime("%Y-%m-%d")
+            review_date_display = previous_trading_day.strftime("%Y年%m月%d日")
+
+            # 统计各群组的复盘情况
+            review_content = f"📈 每日复盘播报 ({review_date_display})\n\n"
+
+            # 获取所有群组
+            group_ids = set()
+            all_files = self.get_all_checkin_files()
+
+            for file_path in all_files:
+                if "_group_" in file_path:
+                    # 从文件名中提取群组ID
+                    parts = file_path.split("_group_")
+                    if len(parts) > 1:
+                        group_id = parts[1].replace(".json", "")
+                        group_ids.add(group_id)
+
+            if not group_ids:
+                logger.info("暂无群组复盘数据，跳过播报")
+                return
+
+            # 为每个群组生成复盘统计
+            has_content = False
+            for group_id in group_ids:
+                group_summary = await self.generate_group_summary(group_id, review_date, review_date_display)
+                if group_summary and "❌ 生成复盘总结时出错" not in group_summary:
+                    review_content += group_summary + "\n"
+                    has_content = True
+
+            if not has_content:
+                logger.info("没有有效的复盘数据，跳过播报")
+                return
+
+            # 向所有有记录的群组发送复盘播报
+            for group_id, session_id in self.group_sessions.items():
+                try:
+                    # 确保是群组消息会话
+                    if "GroupMessage" in session_id or "group" in session_id.lower():
+                        message_chain = MessageChain().message(f"📈 每日复盘播报\n\n{review_content}")
+                        success = await self.context.send_message(session_id, message_chain)
+                        if success:
+                            logger.info(f"成功向群组 {group_id} 发送复盘播报")
+                        else:
+                            logger.warning(f"向群组 {group_id} 发送复盘播报失败")
+                except Exception as e:
+                    logger.error(f"向群组 {group_id} 发送复盘播报时出错: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"发送每日复盘播报时出错: {e}")
+
     async def terminate(self):
         """插件卸载时调用"""
+        # 关闭调度器
+        if self.scheduler.running:
+            self.scheduler.shutdown()
         logger.info("复盘打卡插件已卸载")
