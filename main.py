@@ -834,12 +834,20 @@ class FuPanPlugin(Star):
             if not checkin_texts:
                 return ""
 
-            input_text = "以下是群组成员的交易复盘内容：\n" + "\n".join(checkin_texts) + "\n\n请对以上内容进行总结和分析，提供一个简洁的综合评述："
+            # 获取交易日信息
+            if group_checkins and "trading_day" in group_checkins[0]:
+                trading_day = group_checkins[0]["trading_day"]
+                next_trading_day = group_checkins[0].get("next_trading_day", "未知")
+                trading_info = f"复盘交易日: {trading_day}, 下一交易日: {next_trading_day}\n\n"
+            else:
+                trading_info = ""
+
+            input_text = f"以下是群组成员在{trading_info}的交易复盘观点，请总结大家的主要看法和观点：\n" + "\n".join(checkin_texts) + "\n\n请以简洁的方式总结以上成员的复盘观点，按观点相似性进行归类："
 
             # 调用LLM进行文本处理
             llm_resp = await provider.text_chat(
                 prompt=input_text,
-                system_prompt="你是一个专业的交易分析师，擅长总结和分析交易者的复盘内容。请提供简洁、有价值的综合评述。"
+                system_prompt="你是一个专业的交易观点总结助手。请客观总结群组成员的交易复盘观点，按相似观点进行归类，不要评价观点的对错或提供交易建议。只需总结大家的看法和观点。"
             )
 
             if llm_resp and hasattr(llm_resp, 'completion_text'):
